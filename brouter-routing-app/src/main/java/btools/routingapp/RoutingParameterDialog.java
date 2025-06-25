@@ -379,7 +379,7 @@ public class RoutingParameterDialog extends AppCompatActivity {
               //L.v("AFTrack", "device: "+device.getName() + " -- " + device.getAddress());
               entryValues[i] = "" + i;
               entries[i] = tmp.trim();
-              if (entryValues[i].equals(s)) ii = i;
+              if (entries[i].split("=")[0].equals(s)) ii = i;
               i++;
             }
             if (p.value.equals(s)) sharedValues.edit().remove(p.name).apply();
