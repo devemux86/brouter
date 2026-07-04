@@ -133,17 +133,46 @@ public class RoutingEngine extends Thread {
   private static final double SNAP_REJECT_COSTFACTOR_DEFAULT = 10.0;
 
   /**
-   * Isochrone Dijkstra cost budget.
+   * Isochrone Dijkstra cost-budget calibration.
    *
-   * <p>The fixed budget {@code searchRadius * 4} produces wildly different
-   * physical pool depths depending on the profile costfactor: ~3× searchRadius
-   * for fastbike (costfactor ≈ 1.3), ~1.33× for mtb (costfactor ≈ 3). A 5-step
-   * loop needs pool depth ≈ 2× searchRadius; mtb's pool is too clustered and
-   * the planner can collapse to half target length if the pool is too shallow.
-   * AUTO now tries ISO_GREEDY first, so the planner must fall back to per-step
-   * graph-native candidates when the start-centered iso pool is insufficient
-   * instead of returning a weak route from clustered data.
+   * <p>A fixed budget {@code searchRadius × ISO_BUDGET_FLOOR_FACTOR} produces
+   * wildly different physical pool depths depending on the profile's effective
+   * cost-per-air-meter: ~2× searchRadius air reach for fastbike (costfactor
+   * ≈ 1.3 × road indirectness ≈ 1.5), ~1.3× for mtb (costfactor ≈ 3), and a
+   * starvation collapse for high-penalty profiles (an escape-class profile
+   * measured at cost/m 8.9 reached only ~0.45× searchRadius — a 5.7km pool for
+   * a 12.7km radius). A shallow, clustered pool makes the greedy planner
+   * collapse to roughly half the requested loop length.
+   *
+   * <p>Fix: single-pass in-flight calibration. Dijkstra pops arrive in strictly
+   * increasing cost order, so the pops whose cost falls in
+   * {@code [ISO_CALIBRATION_SAMPLE_LO, 1.0] × searchRadius} form exactly the
+   * frontier band a separate probe expansion would measure. Their median
+   * cost-per-air-meter ({@code path.cost / airDist}) estimates the terrain's
+   * effective costfactor × indirectness. At the first pop past the checkpoint
+   * ({@code cost > searchRadius}) the budget is recomputed as
+   * {@code ISO_TARGET_REACH_FACTOR × searchRadius × medianCostEff}, clamped to
+   * {@code [ISO_BUDGET_FLOOR_FACTOR, ISO_BUDGET_CAP_FACTOR] × searchRadius}.
+   *
+   * <p>Why this is safe for the contour picks: the floor keeps every possible
+   * contour target (25% of a ≥4× budget = ≥1× searchRadius) at or after the
+   * checkpoint. When a raise fires, the frontier/contour best-scores are reset;
+   * every node that could competitively fit the raised targets pops after the
+   * checkpoint, so the reset discards nothing that could have won. When no
+   * raise fires (fastbike lands on the floor), behavior is bit-identical to
+   * the historical fixed budget. The geographic cutoff (1.5× searchRadius)
+   * stays the outer physical bound — the raised budget lets slow directions
+   * reach it instead of starving; {@code maxNodes} and the expansion deadline
+   * still bound worst-case work.
    */
+  static final double ISO_BUDGET_FLOOR_FACTOR = 4.0;
+  static final double ISO_BUDGET_CAP_FACTOR = 12.0;
+  /** Target air reach as a multiple of searchRadius (33% margin past the 1.5× geo cutoff). */
+  static final double ISO_TARGET_REACH_FACTOR = 2.0;
+  /** Lower edge of the calibration sampling band, as a fraction of searchRadius (upper edge = 1.0). */
+  static final double ISO_CALIBRATION_SAMPLE_LO = 0.7;
+  /** Below this many band samples the calibration is skipped (sparse graph → keep the floor). */
+  static final int ISO_CALIBRATION_MIN_SAMPLES = 30;
 
   private int MAX_DYNAMIC_RANGE = 60000;
 
@@ -2446,6 +2475,17 @@ public class RoutingEngine extends Thread {
         || routingContext.roundTripSteerVias)
         && algo == RoundTripAlgorithm.GREEDY;
     accumulatingDesirabilityGrid = buildDesirabilityGrid;
+    // NOTE (measured 2026-07-04, do not re-attempt without new evidence):
+    // adopting the expansion's compiled step-1 legs as planner sub-legs
+    // (includeCandidateTracks=true here + routedTrack forwarding at step 1)
+    // was implemented and A/B-measured on the deterministic Basel matrix.
+    // Result: quality-neutral mean with a systematic short-bias (exact
+    // Dijkstra legs are shorter than the pass1coefficient-directed legs the
+    // planner is tuned around), one deterministic shipped regression
+    // (basel_30km_gravel_W: AUTO 0.84 -> 0.58 composite, 21km for a 30km
+    // request), and no latency win (+4%: track-compile overhead outweighed
+    // the saved step-1 re-routes). Reverted; diff preserved in the session
+    // findings.
     IsochroneExpansionResult iso = (algo == RoundTripAlgorithm.ISO_GREEDY || buildDesirabilityGrid)
       ? runIsochroneExpansion(start, searchRadius)
       : null;
@@ -4015,6 +4055,24 @@ public class RoutingEngine extends Thread {
     return costError - AIR_REACH_BONUS_WEIGHT * airReachBonus;
   }
 
+  /**
+   * Calibrated isochrone cost budget from the sampled frontier band (see the
+   * ISO_BUDGET_* class comment): {@code ISO_TARGET_REACH_FACTOR × searchRadius
+   * × median cost-per-air-meter}. Returns the floor when the band is too
+   * sparse to trust ({@code sampleCount < ISO_CALIBRATION_MIN_SAMPLES}).
+   * Never below the floor (the historical fixed budget), never above the cap.
+   */
+  static int calibratedIsoBudget(double[] samples, int sampleCount, double searchRadius) {
+    int floor = (int) (searchRadius * ISO_BUDGET_FLOOR_FACTOR);
+    if (sampleCount < ISO_CALIBRATION_MIN_SAMPLES) return floor;
+    double[] band = java.util.Arrays.copyOf(samples, sampleCount);
+    java.util.Arrays.sort(band);
+    double medianCostEff = band[sampleCount / 2];
+    double budget = ISO_TARGET_REACH_FACTOR * searchRadius * medianCostEff;
+    double cap = searchRadius * ISO_BUDGET_CAP_FACTOR;
+    return (int) Math.min(cap, Math.max(floor, budget));
+  }
+
   /** {@code clamp(dist / searchRadius, 0, 1)}; 0 when searchRadius is non-positive (avoids a 0/0 NaN). */
   static double clampedAirReachBonus(double dist, double searchRadius) {
     if (searchRadius <= 0.0) {
@@ -4086,12 +4144,26 @@ public class RoutingEngine extends Thread {
    * @return frontier table + road-native candidate pool; {@code null} on failure
    */
   IsochroneExpansionResult runIsochroneExpansion(OsmNodeNamed start, double searchRadius) {
-    return runIsochroneExpansion(start, searchRadius, null, false);
+    // Start-centered expansion (ISO_GREEDY pool, frontier table, desirability
+    // grid): budget calibration ON — searchRadius here is the loop radius the
+    // reach target is defined against.
+    return runIsochroneExpansion(start, searchRadius, null, false, true);
   }
 
   IsochroneExpansionResult runIsochroneExpansion(OsmNodeNamed start, double searchRadius,
                                                  OsmTrack refTrack,
                                                  boolean includeCandidateTracks) {
+    // Per-step callers (GraphNativeCandidateProvider expands a local disk
+    // around the current node each step): calibration OFF — their radius is a
+    // step window, not the loop radius, so the reach-target formula does not
+    // apply and the historical fixed budget is the correct sizing.
+    return runIsochroneExpansion(start, searchRadius, refTrack, includeCandidateTracks, false);
+  }
+
+  private IsochroneExpansionResult runIsochroneExpansion(OsmNodeNamed start, double searchRadius,
+                                                         OsmTrack refTrack,
+                                                         boolean includeCandidateTracks,
+                                                         boolean calibrateBudget) {
     // Phase 1: Match start point (loads segments via directWeaving, consumes node data)
     resetCache(false);
     MatchedWaypoint startMwp = new MatchedWaypoint();
@@ -4131,9 +4203,22 @@ public class RoutingEngine extends Thread {
     OsmPath startPath1 = getStartPath(n1, n2, startMwp, null, false);
     OsmPath startPath2 = getStartPath(n2, n1, startMwp, null, false);
 
-    // Cost budget: searchRadius * 4 to ensure the expansion reaches the full searchRadius
-    // in all directions. Profile costfactor (~1.3) × road indirectness (~1.5) × safety margin.
-    int costBudget = (int) (searchRadius * 4);
+    // Provisional cost budget = the floor (the historical fixed constant). The
+    // in-flight calibration below can only RAISE it — see the class-level
+    // ISO_BUDGET_* comment. Healthy profiles (fastbike: costEff ≈ 2.0 →
+    // calibrated 4×) land on the floor and keep bit-identical behavior.
+    int costBudget = (int) (searchRadius * ISO_BUDGET_FLOOR_FACTOR);
+    // Calibration state: sample cost-per-air-meter in the band
+    // [ISO_CALIBRATION_SAMPLE_LO, 1.0] × searchRadius, finalize at the first
+    // pop past the checkpoint. Pops arrive in increasing cost order, so the
+    // band is populated completely before the checkpoint fires.
+    final int calibrationCheckpointCost = (int) searchRadius;
+    final int calibrationSampleLoCost = (int) (searchRadius * ISO_CALIBRATION_SAMPLE_LO);
+    // Starting "already calibrated" disables both the sampling and the
+    // finalize hook — per-step callers keep the fixed floor budget.
+    boolean isoBudgetCalibrated = !calibrateBudget;
+    double[] costEffSamples = calibrateBudget ? new double[256] : null;
+    int costEffSampleCount = 0;
     // Geographic cutoff: don't expand beyond 1.5× searchRadius (prevents runaway)
     double geoRadiusCutoff = searchRadius * 1.5;
     // Scale maxNodes with search area so dense regions (Berlin) reach the cost
@@ -4215,6 +4300,32 @@ public class RoutingEngine extends Thread {
       if (path == null) break;
       if (path.airdistance == -1) continue; // invalidated
 
+      // In-flight budget calibration: finalize at the first pop past the
+      // checkpoint (pops arrive in increasing cost order, so the sample band
+      // below is complete here). Raising the budget resets the frontier and
+      // contour picks — every competitive fit for the raised targets (all
+      // ≥ checkpoint, guaranteed by the floor) pops after this point, so the
+      // reset discards nothing that could have won. No raise = bit-identical
+      // to the historical fixed budget.
+      if (!isoBudgetCalibrated && path.cost > calibrationCheckpointCost) {
+        isoBudgetCalibrated = true;
+        int calibrated = calibratedIsoBudget(costEffSamples, costEffSampleCount, searchRadius);
+        if (calibrated > costBudget) {
+          logInfo("isochrone: calibrated cost budget " + costBudget + " -> " + calibrated
+            + " (x" + String.format(Locale.ROOT, "%.1f",
+              calibrated / searchRadius) + " searchRadius, "
+            + costEffSampleCount + " band samples)");
+          costBudget = calibrated;
+          for (int k = 0; k < contourCount; k++) {
+            contourCosts[k] = (int) (contourLabels[k] * 0.01 * costBudget);
+          }
+          java.util.Arrays.fill(bucketBestScore, Double.POSITIVE_INFINITY);
+          for (double[] row : bucketContourBestScore) {
+            java.util.Arrays.fill(row, Double.POSITIVE_INFINITY);
+          }
+        }
+      }
+
       // Cost cutoff — Dijkstra: once popped cost exceeds budget, all remaining do too
       if (path.cost > costBudget) break;
 
@@ -4259,6 +4370,15 @@ public class RoutingEngine extends Thread {
       }
       if (dist > 50) { // skip very close nodes (noisy bearings)
         int pcost = path.cost;
+        // Calibration band sample: cost-per-air-meter of frontier-band pops.
+        // The finalize check above flips the flag at the first pop past the
+        // checkpoint, so this band is exactly [SAMPLE_LO, 1.0] × searchRadius.
+        if (!isoBudgetCalibrated && pcost >= calibrationSampleLoCost) {
+          if (costEffSampleCount == costEffSamples.length) {
+            costEffSamples = java.util.Arrays.copyOf(costEffSamples, costEffSamples.length * 2);
+          }
+          costEffSamples[costEffSampleCount++] = pcost / dist;
+        }
         double bearing = CheapRuler.getScaledBearing(start.ilon, start.ilat, curIlon, curIlat);
         int bucket = ((int) (bearing / bucketSize)) % bucketCount;
         if (bucket < 0) bucket += bucketCount;

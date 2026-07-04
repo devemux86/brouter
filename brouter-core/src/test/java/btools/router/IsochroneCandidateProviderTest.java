@@ -4,6 +4,7 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.util.ArrayList;
@@ -29,10 +30,45 @@ public class IsochroneCandidateProviderTest {
   private static final int START_ILAT = 140_000_000;
 
   private static IsoCandidate at(int bucket, double airDist, int hits, int contour) {
+    return at(bucket, airDist, hits, contour, null);
+  }
+
+  private static IsoCandidate at(int bucket, double airDist, int hits, int contour,
+                                 OsmTrack track) {
     double bearing = bucket * 10.0 + 5.0;
     int[] pos = CheapRuler.destination(START_ILON, START_ILAT, airDist, bearing);
     return new IsoCandidate(pos[0], pos[1], bearing, airDist, (int) (airDist * 1.3),
-      bucket, hits, contour);
+      bucket, hits, contour, track);
+  }
+
+  // ----- start-anchored paths are never forwarded as sub-legs ----------------
+
+  @Test
+  public void neverForwardsStoredTracksAsRoutedLegs() {
+    // Contract pin: the pool's stored paths are start-anchored placement data
+    // and must NOT surface as adoptable routedTrack legs at ANY step — the
+    // planner re-routes instead. Forwarding them at step 1 (where the anchor
+    // matches) was implemented and A/B-measured quality-negative on the
+    // deterministic Basel matrix (systematic short-bias, one shipped collapse,
+    // no latency win) — see the note in RoutingEngine.doGreedyRoundTrip. This
+    // test guards against re-introducing it without new evidence.
+    OsmTrack legTrack = new OsmTrack();
+    List<IsoCandidate> raw = new ArrayList<>();
+    for (int b = 0; b < 12; b++) {
+      raw.add(at(b * 3, 4000, 5, 100, legTrack));
+    }
+    IsochroneCandidateProvider p = IsochroneCandidateProvider.fromPool(SEARCH_RADIUS, 0.0, raw);
+    assertTrue(p.poolSize() > 0);
+
+    for (int step = 1; step <= 3; step++) {
+      List<RoundTripCandidateProvider.CandidatePoint> cands = p.candidatesForStep(
+        START_ILON, START_ILAT, 4000, step, 5, START_ILON, START_ILAT, 0.0, null);
+      assertFalse("step-" + step + " window should contain candidates", cands.isEmpty());
+      for (RoundTripCandidateProvider.CandidatePoint cp : cands) {
+        assertNull("stored start-anchored legs must never be forwarded (step " + step + ")",
+          cp.routedTrack);
+      }
+    }
   }
 
   // ----- core filter pipeline -----

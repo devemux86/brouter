@@ -275,6 +275,9 @@ final class IsochroneCandidateProvider implements RoundTripCandidateProvider {
       // sub-legs: their stored path, if any, runs from the original loop
       // start to the candidate. On later greedy steps the current node is
       // different, so the planner must route from the current node instead.
+      // (Adopting the stored leg at step 1 — where the anchor matches — was
+      // tried and measured quality-negative; see the note at the ISO_GREEDY
+      // expansion call site in RoutingEngine.doGreedyRoundTrip.)
       results.add(cp);
     }
 

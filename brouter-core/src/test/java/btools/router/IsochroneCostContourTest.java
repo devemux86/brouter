@@ -202,6 +202,89 @@ public class IsochroneCostContourTest {
     assertTrue("closer-from-above beats farther-from-below",  sAbove < sBelow);
   }
 
+  // ----- calibrated cost budget ----------------------------------------------
+
+  /** Build a sample array where every entry is the given costEff value. */
+  private static double[] uniformSamples(int n, double costEff) {
+    double[] s = new double[n];
+    Arrays.fill(s, costEff);
+    return s;
+  }
+
+  @Test
+  public void calibrationKeepsFloorWhenBandTooSparse() {
+    // Below MIN_SAMPLES the estimate is untrusted — keep the historical floor.
+    double sr = 5000;
+    int n = RoutingEngine.ISO_CALIBRATION_MIN_SAMPLES - 1;
+    int budget = RoutingEngine.calibratedIsoBudget(uniformSamples(n, 9.0), n, sr);
+    assertEquals((int) (sr * RoutingEngine.ISO_BUDGET_FLOOR_FACTOR), budget);
+  }
+
+  @Test
+  public void calibrationLandsOnFloorForHealthyProfile() {
+    // fastbike-like terrain: costEff ≈ 2.0 (costfactor 1.3 × indirectness 1.5)
+    // → 2.0 × 2 = 4.0× searchRadius = exactly the floor. Bit-identical to the
+    // historical fixed budget.
+    double sr = 5000;
+    int n = 100;
+    int budget = RoutingEngine.calibratedIsoBudget(uniformSamples(n, 2.0), n, sr);
+    assertEquals((int) (sr * RoutingEngine.ISO_BUDGET_FLOOR_FACTOR), budget);
+  }
+
+  @Test
+  public void calibrationRaisesBudgetForStarvedProfile() {
+    // mtb-like terrain: costEff ≈ 4.5 → budget 9× searchRadius.
+    double sr = 5000;
+    int n = 100;
+    int budget = RoutingEngine.calibratedIsoBudget(uniformSamples(n, 4.5), n, sr);
+    assertEquals((int) (2.0 * sr * 4.5), budget);
+    assertTrue(budget > sr * RoutingEngine.ISO_BUDGET_FLOOR_FACTOR);
+  }
+
+  @Test
+  public void calibrationCapsExtremeCostEff() {
+    // escape-class terrain (measured cost/m 8.9 in production): 2×8.9 = 17.8×
+    // exceeds the cap → clamp to ISO_BUDGET_CAP_FACTOR.
+    double sr = 5000;
+    int n = 100;
+    int budget = RoutingEngine.calibratedIsoBudget(uniformSamples(n, 8.9), n, sr);
+    assertEquals((int) (sr * RoutingEngine.ISO_BUDGET_CAP_FACTOR), budget);
+  }
+
+  @Test
+  public void calibrationNeverShrinksBelowFloor() {
+    // Hypothetical super-cheap terrain (costEff 0.6 — sub-1 can't happen with
+    // costfactor ≥ 1, defensive): budget must not shrink below the floor.
+    double sr = 5000;
+    int n = 100;
+    int budget = RoutingEngine.calibratedIsoBudget(uniformSamples(n, 0.6), n, sr);
+    assertEquals((int) (sr * RoutingEngine.ISO_BUDGET_FLOOR_FACTOR), budget);
+  }
+
+  @Test
+  public void calibrationUsesMedianNotMean() {
+    // A few extreme outliers (dead-end pockets) must not drag the estimate:
+    // 60 samples at 2.0 + 40 at 50.0 → median 2.0 → floor, despite mean ≈ 21.
+    double sr = 5000;
+    double[] s = new double[100];
+    Arrays.fill(s, 0, 60, 2.0);
+    Arrays.fill(s, 60, 100, 50.0);
+    int budget = RoutingEngine.calibratedIsoBudget(s, 100, sr);
+    assertEquals((int) (sr * RoutingEngine.ISO_BUDGET_FLOOR_FACTOR), budget);
+  }
+
+  @Test
+  public void calibrationIgnoresGarbagePastSampleCount() {
+    // The samples array is a growable buffer — entries past sampleCount are
+    // uninitialized slack and must not affect the result.
+    double sr = 5000;
+    double[] s = new double[64];
+    Arrays.fill(s, 4.5);
+    Arrays.fill(s, 32, 64, 999.0); // garbage slack
+    int budget = RoutingEngine.calibratedIsoBudget(s, 32, sr);
+    assertEquals((int) (2.0 * sr * 4.5), budget);
+  }
+
   // ----- frontier road-native coord extraction ------------------------------
 
   @Test
