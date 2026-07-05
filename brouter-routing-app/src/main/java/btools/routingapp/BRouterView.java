@@ -234,8 +234,16 @@ public class BRouterView extends View {
         System.currentTimeMillis() - lastTimeoutTime < 1800000) {
         BufferedReader br = new BufferedReader(new FileReader(lastTimeoutFile));
         String repeatProfile = br.readLine();
+        String tmp = br.readLine();
+        tmp = br.readLine();
         br.close();
-        profiles.add(0, "<repeat:" + repeatProfile + ">");
+        int wptCount = 0;
+        try {
+          wptCount = Integer.parseInt(tmp);
+        } catch (NumberFormatException e) {}
+        if (wptCount > 1) {
+          profiles.add(0, "<repeat:" + repeatProfile + ">");
+        }
       }
 
       if (!lookupsFound) {
