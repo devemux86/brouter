@@ -69,6 +69,17 @@ tasks.register('integrationTest', Test) {
     }
     finalizedBy 'generateLoopReport'
 
+    // Up-to-date correctness: the suites read routing profiles from
+    // misc/profiles2 at runtime (via projectDir), invisible to Gradle's input
+    // tracking — without this declaration a profile edit followed by
+    // `integrationTest` reports UP-TO-DATE and silently skips (false green).
+    // segments4 (the rd5 tile cache) is a DELIBERATE gap: declaring it would
+    // hash hundreds of MB on every invocation, and tiles only change by
+    // manual download — use --rerun after refreshing tiles.
+    inputs.dir(rootProject.file('misc/profiles2'))
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+        .withPropertyName('routingProfiles')
+
     // Segment handling: fetch missing neighbour tiles, reuse already-present ones
     // without a freshness re-fetch. Override per-run with -Dloop.segments.*.
     systemProperty 'loop.segments.noupdate', System.getProperty('loop.segments.noupdate', 'true')
