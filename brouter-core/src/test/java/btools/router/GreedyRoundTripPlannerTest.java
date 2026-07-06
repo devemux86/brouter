@@ -688,6 +688,117 @@ public class GreedyRoundTripPlannerTest {
     return list;
   }
 
+  // ======================================================================
+  // enforceSourceQuota — graph-native routed-slot guarantee in mixed
+  // (blended ISO_GREEDY) candidate lists. Iso picks are ranked on optimistic
+  // estimates, so without the quota they can monopolize the routed top-K.
+  // ======================================================================
+
+  private static RoundTripCandidateProvider.CandidatePoint scoredCp(
+      double bearing, double score, boolean isoPool) {
+    RoundTripCandidateProvider.CandidatePoint p = cp(bearing);
+    p.score = score;
+    if (isoPool) p.costFromStart = 1234.0; // any non-sentinel value
+    return p;
+  }
+
+  @Test
+  public void enforceSourceQuota_injectsBestGraphNativeAndEvictsWorstIso() {
+    RoundTripCandidateProvider.CandidatePoint iso1 = scoredCp(0, 1.0, true);
+    RoundTripCandidateProvider.CandidatePoint iso2 = scoredCp(90, 2.0, true);
+    RoundTripCandidateProvider.CandidatePoint iso3 = scoredCp(180, 3.0, true);
+    RoundTripCandidateProvider.CandidatePoint graph4 = scoredCp(270, 4.0, false);
+    RoundTripCandidateProvider.CandidatePoint graph5 = scoredCp(45, 5.0, false);
+    List<RoundTripCandidateProvider.CandidatePoint> sorted =
+      new ArrayList<>(List.of(iso1, iso2, iso3, graph4, graph5));
+    List<RoundTripCandidateProvider.CandidatePoint> picked =
+      new ArrayList<>(List.of(iso1, iso2, iso3));
+
+    boolean changed = GreedyRoundTripPlanner.enforceSourceQuota(picked, sorted, 3, 1);
+
+    Assert.assertTrue(changed);
+    Assert.assertEquals(3, picked.size());
+    // Best graph-native (4.0) injected, worst iso (3.0) evicted, score order kept.
+    Assert.assertSame(iso1, picked.get(0));
+    Assert.assertSame(iso2, picked.get(1));
+    Assert.assertSame(graph4, picked.get(2));
+  }
+
+  @Test
+  public void enforceSourceQuota_noopWhenQuotaAlreadyMet() {
+    RoundTripCandidateProvider.CandidatePoint iso1 = scoredCp(0, 1.0, true);
+    RoundTripCandidateProvider.CandidatePoint graph2 = scoredCp(90, 2.0, false);
+    RoundTripCandidateProvider.CandidatePoint iso3 = scoredCp(180, 3.0, true);
+    List<RoundTripCandidateProvider.CandidatePoint> sorted =
+      new ArrayList<>(List.of(iso1, graph2, iso3, scoredCp(270, 4.0, false)));
+    List<RoundTripCandidateProvider.CandidatePoint> picked =
+      new ArrayList<>(List.of(iso1, graph2, iso3));
+
+    Assert.assertFalse(GreedyRoundTripPlanner.enforceSourceQuota(picked, sorted, 3, 1));
+    Assert.assertSame(iso1, picked.get(0));
+    Assert.assertSame(graph2, picked.get(1));
+    Assert.assertSame(iso3, picked.get(2));
+  }
+
+  @Test
+  public void enforceSourceQuota_noopWithoutGraphNativeCandidates() {
+    List<RoundTripCandidateProvider.CandidatePoint> sorted = new ArrayList<>(List.of(
+      scoredCp(0, 1.0, true), scoredCp(90, 2.0, true), scoredCp(180, 3.0, true)));
+    List<RoundTripCandidateProvider.CandidatePoint> picked = new ArrayList<>(sorted);
+
+    Assert.assertFalse(GreedyRoundTripPlanner.enforceSourceQuota(picked, sorted, 3, 1));
+    Assert.assertEquals(3, picked.size());
+  }
+
+  @Test
+  public void enforceSourceQuota_addsWithoutEvictionBelowK() {
+    RoundTripCandidateProvider.CandidatePoint iso1 = scoredCp(0, 1.0, true);
+    RoundTripCandidateProvider.CandidatePoint iso2 = scoredCp(90, 2.0, true);
+    RoundTripCandidateProvider.CandidatePoint graph5 = scoredCp(180, 5.0, false);
+    List<RoundTripCandidateProvider.CandidatePoint> sorted =
+      new ArrayList<>(List.of(iso1, iso2, graph5));
+    List<RoundTripCandidateProvider.CandidatePoint> picked =
+      new ArrayList<>(List.of(iso1, iso2));
+
+    boolean changed = GreedyRoundTripPlanner.enforceSourceQuota(picked, sorted, 3, 1);
+
+    Assert.assertTrue(changed);
+    Assert.assertEquals(3, picked.size());
+    Assert.assertSame(graph5, picked.get(2)); // added, nothing evicted
+  }
+
+  @Test
+  public void enforceSourceQuota_lateBudgetInjectsTwo() {
+    List<RoundTripCandidateProvider.CandidatePoint> isoPicks = new ArrayList<>();
+    for (int i = 0; i < 5; i++) isoPicks.add(scoredCp(i * 72, 1.0 + i, true));
+    RoundTripCandidateProvider.CandidatePoint graph6 = scoredCp(30, 6.0, false);
+    RoundTripCandidateProvider.CandidatePoint graph7 = scoredCp(120, 7.0, false);
+    List<RoundTripCandidateProvider.CandidatePoint> sorted = new ArrayList<>(isoPicks);
+    sorted.add(graph6);
+    sorted.add(graph7);
+    List<RoundTripCandidateProvider.CandidatePoint> picked = new ArrayList<>(isoPicks);
+
+    boolean changed = GreedyRoundTripPlanner.enforceSourceQuota(picked, sorted, 5, 2);
+
+    Assert.assertTrue(changed);
+    Assert.assertEquals(5, picked.size());
+    // The two worst iso picks (scores 5.0, 4.0) gave way to graph6/graph7.
+    Assert.assertTrue(picked.contains(graph6));
+    Assert.assertTrue(picked.contains(graph7));
+    Assert.assertSame(isoPicks.get(0), picked.get(0));
+    Assert.assertSame(isoPicks.get(1), picked.get(1));
+    Assert.assertSame(isoPicks.get(2), picked.get(2));
+  }
+
+  @Test
+  public void enforceSourceQuota_pureGraphNativeListUntouched() {
+    List<RoundTripCandidateProvider.CandidatePoint> sorted = new ArrayList<>(List.of(
+      scoredCp(0, 1.0, false), scoredCp(90, 2.0, false), scoredCp(180, 3.0, false)));
+    List<RoundTripCandidateProvider.CandidatePoint> picked = new ArrayList<>(sorted);
+
+    Assert.assertFalse(GreedyRoundTripPlanner.enforceSourceQuota(picked, sorted, 3, 1));
+  }
+
   @Test
   public void pickDiverseTopK_cullsNearBearingCandidates() {
     // 10° is within 30° of the already-picked 0° → culled; 200° is far → picked.

@@ -669,6 +669,18 @@ public class GreedyRoundTripPlanner {
           ? MAX_ROUTE_ATTEMPTS_LATE : MAX_ROUTE_ATTEMPTS;
         List<RoundTripCandidateProvider.CandidatePoint> toRoute =
           pickDiverseTopK(candidates, routeBudget);
+        // Source fairness for the routed slots (blended ISO_GREEDY only; no-op
+        // for single-source lists): phase-1 ranks iso-pool picks on optimistic
+        // airDist*indirectness estimates but graph-native picks on compiled
+        // routed truth, so a mixed sort lets iso picks monopolize the routed
+        // top-K and the cost-aware routed comparison never prices the honest
+        // local alternative. Guarantee it a seat; phase-2 stays the judge.
+        int minGraphNative = routeBudget > MAX_ROUTE_ATTEMPTS
+          ? GRAPH_NATIVE_MIN_ROUTED_LATE : GRAPH_NATIVE_MIN_ROUTED;
+        if (enforceSourceQuota(toRoute, candidates, routeBudget, minGraphNative)) {
+          result.addDiagnostic("step " + step + " attempt " + attempt
+            + ": source quota injected graph-native candidate(s) into routed top-" + routeBudget);
+        }
 
         // Phase 1 Step 2: keep a ranked list of routed candidates instead of
         // a single best-pick. Step 2 is structural and behavior-preserving —
@@ -733,8 +745,7 @@ public class GreedyRoundTripPlanner {
           // costFromStart; graph-native/non-start-iso candidates use NO_ISO_COST. We count
           // BEFORE the null/zero-distance guard so "routed" reflects what
           // Dijkstra attempted, not what succeeded.
-          boolean isIsoCandidate =
-            cp.costFromStart != RoundTripCandidateProvider.NO_ISO_COST;
+          boolean isIsoCandidate = isIsoPoolCandidate(cp);
           if (isIsoCandidate) routedIso++; else routedNonIso++;
           if (subTrack == null || subTrack.distance == 0) continue;
 
@@ -1388,6 +1399,87 @@ public class GreedyRoundTripPlanner {
         + ", maxContiguous=" + qr.getMaxContiguousReuseMeters() + "m");
       for (String d : qr.getDisclosures()) result.addDiagnostic("disclosure: " + d);
     }
+  }
+
+  /**
+   * Minimum graph-native (per-step, non-iso) candidates guaranteed a routed
+   * slot when the step's candidate list mixes sources (the ISO_GREEDY blend).
+   *
+   * <p>Why: phase-1 ranks candidates on estimated leg distance. Graph-native
+   * candidates carry their expansion-compiled routed truth (detours included)
+   * while start-pool iso candidates are estimated as airDist × indirectnessEst
+   * — systematically optimistic exactly where warped terrain makes real legs
+   * long. In a mixed sort the optimistic guesses outrank the honest
+   * measurements, iso picks monopolize the routed top-K, and the fair,
+   * cost-aware routed comparison ({@link #combinedRoutedScore}) never gets to
+   * price the fresh local alternative. The 2026-07 AUTO winner-attribution
+   * study measured the downstream effect: of 139 cases where plain GREEDY beat
+   * ISO_GREEDY, the dominant loss clusters were pricier surfaces (38 cases,
+   * median +0.8 cost/m on gravel) and extra self-crossings (38 cases) — both
+   * shapes of "the cheaper, cleaner local leg was never routed". Reserving a
+   * seat changes nothing when the honest pick deserves to lose — phase-2
+   * still judges on routed truth.
+   */
+  private static final int GRAPH_NATIVE_MIN_ROUTED = 1;
+  /** Quota at the late/retry budget ({@link #MAX_ROUTE_ATTEMPTS_LATE} slots). */
+  private static final int GRAPH_NATIVE_MIN_ROUTED_LATE = 2;
+
+  /**
+   * Start-pool iso candidates carry a real {@code costFromStart}; per-step
+   * graph-native candidates carry the {@code NO_ISO_COST} sentinel (they have
+   * real {@code bucketHits} but no start-anchored cost). Single source of
+   * truth for the source split used by the routed-slot quota and the
+   * routed-iso diagnostics.
+   */
+  static boolean isIsoPoolCandidate(RoundTripCandidateProvider.CandidatePoint cp) {
+    return cp.costFromStart != RoundTripCandidateProvider.NO_ISO_COST;
+  }
+
+  /**
+   * Ensure at least {@code minNonIso} graph-native candidates hold routed
+   * slots in {@code picked} when {@code sorted} has them to offer: add while
+   * under {@code k}, otherwise evict the worst-scored iso pick per injection.
+   * Quota picks skip the angular-spread rule deliberately — at K=3 source
+   * fairness outranks spread, and the routed re-score judges the outcome
+   * either way. No-op for single-source lists (plain GREEDY, or the iso
+   * provider's graph-native fallback). On change, {@code picked} is re-sorted
+   * by heuristic score so downstream ordering semantics stay score-ordered;
+   * returns whether anything changed.
+   */
+  static boolean enforceSourceQuota(List<RoundTripCandidateProvider.CandidatePoint> picked,
+                                    List<RoundTripCandidateProvider.CandidatePoint> sorted,
+                                    int k, int minNonIso) {
+    int nonIso = 0;
+    for (RoundTripCandidateProvider.CandidatePoint cp : picked) {
+      if (!isIsoPoolCandidate(cp)) nonIso++;
+    }
+    int need = Math.min(minNonIso, k) - nonIso;
+    if (need <= 0) return false;
+    boolean changed = false;
+    for (RoundTripCandidateProvider.CandidatePoint cp : sorted) {
+      if (need <= 0) break;
+      if (isIsoPoolCandidate(cp) || picked.contains(cp)) continue;
+      if (picked.size() >= k) {
+        int evict = -1;
+        double worstScore = Double.NEGATIVE_INFINITY;
+        for (int i = 0; i < picked.size(); i++) {
+          RoundTripCandidateProvider.CandidatePoint p = picked.get(i);
+          if (isIsoPoolCandidate(p) && p.score > worstScore) {
+            worstScore = p.score;
+            evict = i;
+          }
+        }
+        if (evict < 0) break; // no iso pick left to displace
+        picked.remove(evict);
+      }
+      picked.add(cp);
+      need--;
+      changed = true;
+    }
+    if (changed) {
+      picked.sort(BY_HEURISTIC_SCORE);
+    }
+    return changed;
   }
 
   /**
