@@ -1642,7 +1642,7 @@ public class RoutingEngineTest {
   public void isoAsymmetry_symmetricFrontier_picksLowestBucketIndex() {
     // All buckets identical → tie-break by lowest bucket index → bucket 0 = 0°.
     double[][] f = uniformFrontier(8000.0, 10000.0, 5);
-    RoutingEngine.IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
+    IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
     Assert.assertTrue("bias should fire when all buckets pass thresholds", bias.applied);
     Assert.assertEquals("tie → bucket 0 (bearing 0°)", 0.0, bias.bearingDegrees, 0.01);
   }
@@ -1666,7 +1666,7 @@ public class RoutingEngineTest {
       h[i] = 8;
     }
     double[][] f = frontier36(a, c, h);
-    RoutingEngine.IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
+    IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
     Assert.assertTrue("bias should fire", bias.applied);
     Assert.assertTrue("bearing should be in the east sector (80°-120°)",
       bias.bearingDegrees >= 80.0 && bias.bearingDegrees <= 120.0);
@@ -1677,7 +1677,7 @@ public class RoutingEngineTest {
   public void isoAsymmetry_sparseBuckets_noBiasApplied() {
     // All buckets reach far enough but hit count is below the minHits=3 floor.
     double[][] f = uniformFrontier(8000.0, 10000.0, 1);
-    RoutingEngine.IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
+    IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
     Assert.assertFalse("hits < 3 disqualifies all buckets", bias.applied);
   }
 
@@ -1685,7 +1685,7 @@ public class RoutingEngineTest {
   public void isoAsymmetry_reachFloorNotMet_noBiasApplied() {
     // hits OK but airDist below 0.6 * searchRadius (= 6000m).
     double[][] f = uniformFrontier(4000.0, 10000.0, 5);
-    RoutingEngine.IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
+    IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
     Assert.assertFalse("airDist < 0.6 * searchRadius disqualifies all buckets", bias.applied);
   }
 
@@ -1708,14 +1708,14 @@ public class RoutingEngineTest {
         f[i] = new double[]{i * 10.0, 8000.0, 10000.0, 5};       // 4-element
       }
     }
-    RoutingEngine.IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
+    IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
     Assert.assertTrue("4-element probe entries must still be considered", bias.applied);
   }
 
   @Test
   public void isoAsymmetry_resultCarriesAllTelemetry() {
     double[][] f = uniformFrontier(8000.0, 10000.0, 5);
-    RoutingEngine.IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
+    IsoAsymmetryBias bias = RoutingEngine.computeIsoAsymmetryBearing(f, 10000.0);
     Assert.assertTrue(bias.applied);
     Assert.assertEquals(0.0, bias.bearingDegrees, 0.01);
     Assert.assertEquals(10000.0 / 8000.0, bias.indirectness, 0.001);
@@ -1725,7 +1725,7 @@ public class RoutingEngineTest {
 
   @Test
   public void isoAsymmetryNone_carriesSentinels() {
-    RoutingEngine.IsoAsymmetryBias none = RoutingEngine.IsoAsymmetryBias.NONE;
+    IsoAsymmetryBias none = IsoAsymmetryBias.NONE;
     Assert.assertFalse(none.applied);
     Assert.assertTrue(Double.isNaN(none.bearingDegrees));
     Assert.assertTrue(Double.isNaN(none.indirectness));
@@ -1739,7 +1739,7 @@ public class RoutingEngineTest {
   public void frontierAxis_symmetricFrontier_noStrongAxis() {
     // Uniform reach → eigenvalues nearly equal → no strong axis.
     double[][] f = uniformFrontier(8000.0, 10000.0, 5);
-    RoutingEngine.FrontierAxis axis = RoutingEngine.computeFrontierAxis(f, 10000.0);
+    FrontierAxis axis = RoutingEngine.computeFrontierAxis(f, 10000.0);
     Assert.assertFalse("uniform reach should not register as strong axis", axis.hasStrongAxis);
     Assert.assertTrue("strength should be near 1.0", axis.strength < 1.5);
   }
@@ -1762,7 +1762,7 @@ public class RoutingEngineTest {
       h[i] = 5;
     }
     double[][] f = frontier36(a, c, h);
-    RoutingEngine.FrontierAxis axis = RoutingEngine.computeFrontierAxis(f, 10000.0);
+    FrontierAxis axis = RoutingEngine.computeFrontierAxis(f, 10000.0);
     Assert.assertTrue("east-west elongation should register as strong axis", axis.hasStrongAxis);
     // Canonical [0, 180) → axis bearing should be ~90° (E-W).
     Assert.assertEquals("axis bearing ~90°", 90.0, axis.axisBearingDegrees, 10.0);
@@ -1790,7 +1790,7 @@ public class RoutingEngineTest {
       a[i] = 8000.0; // these 3 pass the floor
     }
     double[][] f = frontier36(a, c, h);
-    RoutingEngine.FrontierAxis axis = RoutingEngine.computeFrontierAxis(f, 10000.0);
+    FrontierAxis axis = RoutingEngine.computeFrontierAxis(f, 10000.0);
     Assert.assertFalse(axis.hasStrongAxis);
   }
 
@@ -1818,7 +1818,7 @@ public class RoutingEngineTest {
 
   @Test
   public void frontierAxisNone_carriesSentinels() {
-    RoutingEngine.FrontierAxis none = RoutingEngine.FrontierAxis.NONE;
+    FrontierAxis none = FrontierAxis.NONE;
     Assert.assertFalse(none.hasStrongAxis);
     Assert.assertTrue(Double.isNaN(none.axisBearingDegrees));
     Assert.assertEquals(0.0, none.strength, 0.0);

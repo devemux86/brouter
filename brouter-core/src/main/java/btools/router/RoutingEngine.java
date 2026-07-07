@@ -5008,45 +5008,6 @@ public class RoutingEngine extends Thread {
     return d > 180 ? 360 - d : d;
   }
 
-  /** Phase 2.1 result: principal axis of the reachable-frontier
-   *  displacements, with eigenvalue-ratio strength. */
-  static final class FrontierAxis {
-    static final FrontierAxis NONE = new FrontierAxis(false, Double.NaN, 0.0);
-    final boolean hasStrongAxis;
-    /** Axis bearing in [0, 180) — axis is direction-agnostic. */
-    final double axisBearingDegrees;
-    /** Eigenvalue ratio λ1 / λ2 of the displacement covariance. Strong axis
-     *  iff this is at least {@link #PHASE_2_1_STRONG_AXIS_RATIO}. */
-    final double strength;
-
-    FrontierAxis(boolean hasStrongAxis, double axisBearingDegrees, double strength) {
-      this.hasStrongAxis = hasStrongAxis;
-      this.axisBearingDegrees = axisBearingDegrees;
-      this.strength = strength;
-    }
-  }
-
-  /** Phase 2.0 result: which bucket of the isochrone frontier the bias
-   *  selected, plus the metadata for telemetry. */
-  static final class IsoAsymmetryBias {
-    static final IsoAsymmetryBias NONE =
-      new IsoAsymmetryBias(false, Double.NaN, Double.NaN, -1, -1);
-    final boolean applied;
-    final double bearingDegrees;
-    final double indirectness;
-    final int hits;
-    final int airDistMeters;
-
-    IsoAsymmetryBias(boolean applied, double bearingDegrees, double indirectness,
-                     int hits, int airDistMeters) {
-      this.applied = applied;
-      this.bearingDegrees = bearingDegrees;
-      this.indirectness = indirectness;
-      this.hits = hits;
-      this.airDistMeters = airDistMeters;
-    }
-  }
-
   /**
    * Sort directions to form a coherent loop, starting from the direction
    * closest to startDirection and proceeding clockwise.
