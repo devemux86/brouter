@@ -2478,9 +2478,20 @@ public class RoutingEngine extends Thread {
     RoundTripCandidateProvider provider = buildCandidateProvider(algo, start, searchRadius, effectiveDirection, iso);
     int baseSubRouteCount = selectGreedySubRouteCount(desiredDistance, routingContext.getProfileName());
 
+    // Return-distance oracle (F6): sector-resolved return estimates from the
+    // start-centered pool expansion when one exists (ISO_GREEDY — largest
+    // coverage). Plain GREEDY deliberately has no oracle: a step-1 expansion
+    // oracle was measured quality-negative, so null means the planner falls
+    // back to the global-EMA estimate everywhere.
+    ReturnDistanceOracle returnOracle = ReturnDistanceOracle.build(iso, start.ilon, start.ilat);
+    if (returnOracle != null) {
+      logInfo("greedy: return oracle from pool expansion (kappa="
+        + String.format(Locale.ROOT, "%.2f", returnOracle.kappa()) + ")");
+    }
+
     // First attempt — user direction (or Phase 2.0 biased bearing).
     RoundTripResult result = runGreedyAttempt(start, searchRadius, desiredDistance,
-      effectiveDirection, baseSubRouteCount, provider, bias);
+      effectiveDirection, baseSubRouteCount, provider, bias, returnOracle);
 
     // Phase 2.1: if the first attempt degraded AND the user supplied an
     // explicit direction AND the frontier has a strong terrain axis AND
@@ -2506,7 +2517,7 @@ public class RoutingEngine extends Thread {
         + "° (strength=" + String.format("%.1fx", frontierAxis.strength)
         + "); retrying with axis-aligned direction " + (int) phase21RetryDir + "°");
       RoundTripResult retry = runGreedyAttempt(start, searchRadius, desiredDistance,
-        phase21RetryDir, baseSubRouteCount, provider, bias);
+        phase21RetryDir, baseSubRouteCount, provider, bias, returnOracle);
       if (!isDegradedGreedyResult(retry)
           && retry != null && retry.getLoopWaypoints() != null
           && retry.getLoopWaypoints().size() >= 4) {
@@ -4195,7 +4206,10 @@ public class RoutingEngine extends Thread {
     double[] cellKxKy = CheapRuler.getLonLatToMeterScales(start.ilat);
     int cellDivLon = Math.max(1, (int) (REACHABILITY_CELL_M / cellKxKy[0]));
     int cellDivLat = Math.max(1, (int) (REACHABILITY_CELL_M / cellKxKy[1]));
-    java.util.Set<Long> visitedCells = new java.util.HashSet<>(4096);
+    // Cell -> min Dijkstra cost. Pops arrive in cost order, so the first touch
+    // of a cell records its minimum (putIfAbsent); key presence doubles as the
+    // reachability cloud, the value feeds the ReturnDistanceOracle.
+    Map<Long, Integer> cellMinCost = new HashMap<>(4096);
 
     long expansionDeadline = transientExpansionDeadline;
     if (roundTripRequestDeadline > 0) {
@@ -4268,8 +4282,8 @@ public class RoutingEngine extends Thread {
       // (see AIR_REACH_BONUS_WEIGHT).
       int curIlon = currentNode.getILon();
       int curIlat = currentNode.getILat();
-      visitedCells.add((((long) (curIlon / cellDivLon)) << 32)
-        | ((curIlat / cellDivLat) & 0xFFFFFFFFL));
+      cellMinCost.putIfAbsent((((long) (curIlon / cellDivLon)) << 32)
+        | ((curIlat / cellDivLat) & 0xFFFFFFFFL), path.cost);
       double dist = CheapRuler.distance(start.ilon, start.ilat, curIlon, curIlat);
       if (dist > 50) { // skip very close nodes (noisy bearings)
         int pcost = path.cost;
@@ -4428,7 +4442,7 @@ public class RoutingEngine extends Thread {
       + ", " + results.size() + "/" + bucketCount + " buckets populated");
     if (results.isEmpty()) return null;
     return new IsochroneExpansionResult(results.toArray(new double[0][]), candidatePool,
-      visitedCells, cellDivLon, cellDivLat);
+      cellMinCost, cellDivLon, cellDivLat);
   }
 
   private OsmTrack compileCandidateTrack(OsmPath path) {
@@ -4822,7 +4836,8 @@ public class RoutingEngine extends Thread {
                                            double desiredDistance, double tryDirection,
                                            int baseSubRouteCount,
                                            RoundTripCandidateProvider provider,
-                                           IsoAsymmetryBias bias) {
+                                           IsoAsymmetryBias bias,
+                                           ReturnDistanceOracle returnOracle) {
     RoundTripResult result = null;
     for (int subRouteCount : greedySubRouteCountPlan(baseSubRouteCount)) {
       // Request-budget gate on the retry ladder: each plan() used to get a
@@ -4841,6 +4856,7 @@ public class RoutingEngine extends Thread {
       planner.setHostilityActive(RoundTripQualityGate.isPavedProfile(routingContext.getProfileName()));
       planner.setProfileName(routingContext.getProfileName());
       planner.setVarietySeed(routingContext.getRoundTripSeed());
+      planner.setReturnOracle(returnOracle);
       planner.setExternalDeadline(roundTripRequestDeadline == 0
         ? Long.MAX_VALUE : roundTripRequestDeadline);
       result = planner.plan(start, desiredDistance, tryDirection);

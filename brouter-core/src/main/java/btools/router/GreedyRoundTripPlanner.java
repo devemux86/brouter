@@ -266,9 +266,16 @@ public class GreedyRoundTripPlanner {
   // chaos-out via different geometry, raising chaotic-loop count by
   // +11 vs weight=1.0 (production chaotic 40 → 51).
   static final double PARTIAL_SELF_INTERSECTION_WEIGHT = 1.0;
-  // Multiplier applied to the air-distance return estimate when deciding
-  // whether to skip the return Dijkstra. > 1 means we skip less aggressively.
+  // Multiplier applied to the return estimate when deciding whether to skip
+  // the return Dijkstra. > 1 means we skip less aggressively.
   private static final double RETURN_SKIP_SAFETY = 1.5;
+  /**
+   * Skip-safety when the return estimate is oracle-backed: the sector-resolved
+   * estimate already contains the graph's detour factor toward this position
+   * (the 1.5 fudge existed to cover exactly that blindness in the global-EMA
+   * guess), so only snap/one-way/anti-reuse slack remains to absorb.
+   */
+  private static final double RETURN_SKIP_SAFETY_ORACLE = 1.15;
   /**
    * When the profile-aware candidate snap relocates a via further than this
    * from the original graph-native candidate node, the pre-routed leg (which
@@ -413,6 +420,58 @@ public class GreedyRoundTripPlanner {
 
   public void setExternalDeadline(long deadlineMillis) {
     externalDeadline = deadlineMillis <= 0 ? Long.MAX_VALUE : deadlineMillis;
+  }
+
+  /**
+   * Sector-resolved return-distance estimates (F6 oracle); null = fall back to
+   * the global {@code indirectnessEst} EMA. Set by the engine from the
+   * ISO_GREEDY pool expansion — deliberately NOT built for plain GREEDY:
+   * a lazy oracle from GREEDY's small step-1 expansion was implemented and
+   * measured quality-NEGATIVE (2 better / 5 worse on the anchor corpus). The
+   * step-1 disk covers only the loop's near side, so scoring mixed oracle and
+   * EMA estimate regimes around the coverage boundary and distorted candidate
+   * ranking exactly in constrained starts (coastal half-planes). Revisit only
+   * with a dedicated full-radius start expansion and its own measurement.
+   *
+   * <p><b>Consumer scope: the return-check skip decision ONLY.</b> The oracle
+   * originally also fed candidate scoring (phase-1 + routed re-score); the
+   * 548-cell corpus A/B measured that as a net-neutral wash hiding a new
+   * failure class — four 30km distR crashes (0.86-0.97 → 0.59-0.66), all
+   * caused by moderate return over-estimates (elevation-asymmetric sectors:
+   * costly climb out, cheap ride back) steering placement into premature
+   * contraction. Consumer attribution (three-way: full / scoring-only /
+   * skip-only) pinned every crash on the scoring path and showed the skip
+   * path strictly benign — it even fixes the flagship undershoot cell better
+   * (mallorca_75km distR 0.51 → 0.92) because a skip-path over-estimate is
+   * self-correcting: it only triggers the real return Dijkstra earlier,
+   * converting the estimate into truth, while a ranking over-estimate
+   * substitutes for truth with no correction.
+   */
+  private ReturnDistanceOracle returnOracle;
+  /** Telemetry: return estimates answered by the oracle vs the EMA fallback. */
+  private int oracleEstimates;
+  private int fallbackEstimates;
+
+  void setReturnOracle(ReturnDistanceOracle oracle) {
+    this.returnOracle = oracle;
+  }
+
+  /**
+   * Return-distance estimate in meters from the given position to the loop
+   * start: sector-resolved when the oracle covers the position, the legacy
+   * {@code airDist × indirectnessEst} guess otherwise. {@code air} is passed
+   * in because every caller has already computed it.
+   */
+  private double estimateReturnMeters(int ilon, int ilat, double air, double indirectnessEst) {
+    if (returnOracle != null) {
+      double v = returnOracle.estimateReturnMeters(ilon, ilat, air);
+      if (v >= 0) {
+        oracleEstimates++;
+        return v;
+      }
+    }
+    fallbackEstimates++;
+    return air * indirectnessEst;
   }
 
   /**
@@ -600,6 +659,12 @@ public class GreedyRoundTripPlanner {
             ? cp.routedTrack.distance
             : airDistToCp * indirectnessEst;
           double airDistToStart = CheapRuler.distance(cp.ilon, cp.ilat, start.ilon, start.ilat);
+          // Deliberately the EMA estimate, NOT the return oracle: in candidate
+          // RANKING an oracle over-estimate mis-ranks with no correction, and
+          // consumer attribution (2026-07, 13-cell three-way) showed the
+          // scoring path caused every 30km distR crash the corpus A/B found.
+          // The oracle serves only the return-check skip decision, where an
+          // over-estimate is self-correcting (it merely buys a real Dijkstra).
           double estimatedReturn = airDistToStart * indirectnessEst;
           double distFromStart = airDistToStart;
 
@@ -771,6 +836,7 @@ public class GreedyRoundTripPlanner {
           double actualVisitedRatio = computeTrackVisitedRatio(subTrack,
             visitedEdges, totalDistance, desiredDistance, segLens);
           double airDistToStart = CheapRuler.distance(snappedIlon, snappedIlat, start.ilon, start.ilat);
+          // EMA, not the oracle — same ranking-vs-skip rationale as phase-1.
           double estimatedReturn = airDistToStart * indirectnessEst;
           double distFromPrevious = (prevIlon >= 0)
             ? CheapRuler.distance(prevIlon, prevIlat, snappedIlon, snappedIlat) * indirectnessEst
@@ -920,17 +986,23 @@ public class GreedyRoundTripPlanner {
           }
 
           // --- Closure check (ONE return Dijkstra per trial) ---
-          double airDistToStart = CheapRuler.distance(
-            currentMwp.crosspoint.getILon(), currentMwp.crosspoint.getILat(), start.ilon, start.ilat);
-          double minReturn = airDistToStart * indirectnessEst;
+          int fromRetIlon = currentMwp.crosspoint.getILon();
+          int fromRetIlat = currentMwp.crosspoint.getILat();
+          double airDistToStart = CheapRuler.distance(fromRetIlon, fromRetIlat, start.ilon, start.ilat);
+          boolean oracleBacked = returnOracle != null && returnOracle.covers(fromRetIlon, fromRetIlat);
+          double minReturn = estimateReturnMeters(fromRetIlon, fromRetIlat, airDistToStart, indirectnessEst);
 
           // Skip the return check only when closure is clearly out of reach AND
-          // we still have multiple steps left. ROAD_INDIRECTNESS is a heuristic;
-          // constrained networks can force much longer returns, so apply a safety
-          // factor and never skip on the last two steps where closure matters.
+          // we still have multiple steps left. The safety factor covers the
+          // estimate's blindness to constrained networks forcing much longer
+          // returns — a sector-resolved oracle estimate already carries the
+          // graph's detour truth, so it needs far less headroom than the
+          // global-EMA guess. Never skip on the last two steps where closure
+          // matters.
           boolean isLateStep = step >= subRouteCount - 1;
+          double skipSafety = oracleBacked ? RETURN_SKIP_SAFETY_ORACLE : RETURN_SKIP_SAFETY;
           boolean returnChecked = isLateStep
-            || totalDistance + minReturn * RETURN_SKIP_SAFETY >= desiredDistance * (1 - tolerance);
+            || totalDistance + minReturn * skipSafety >= desiredDistance * (1 - tolerance);
           OsmTrack returnTrack = null;
           OsmTrack returnRef = null;
           if (returnChecked) {
@@ -1328,8 +1400,8 @@ public class GreedyRoundTripPlanner {
    * healthy fleet has P95 headroom well above 0 and near-zero "EXHAUSTED"
    * lines for the standard 40-100km class.
    */
-  private static void stampBudgetDiagnostic(RoundTripResult result, long planStart,
-                                            long planBudgetMs, long deadline) {
+  private void stampBudgetDiagnostic(RoundTripResult result, long planStart,
+                                     long planBudgetMs, long deadline) {
     long now = System.currentTimeMillis();
     long usedMs = now - planStart;
     long headroomMs = deadline - now;
@@ -1345,6 +1417,11 @@ public class GreedyRoundTripPlanner {
       + "ms plan budget, headroom " + headroomMs + "ms"
       + (cappedByRequest ? " (capped from " + planBudgetMs + "ms by request budget)" : "")
       + (headroomMs <= 0 ? " (EXHAUSTED)" : ""));
+    if (oracleEstimates + fallbackEstimates > 0) {
+      result.addDiagnostic("return oracle: " + oracleEstimates + " sector-resolved / "
+        + fallbackEstimates + " EMA-fallback estimates"
+        + (returnOracle == null ? " (no oracle)" : ""));
+    }
   }
 
   private static void stampTelemetry(RoundTripResult result, long planStart,

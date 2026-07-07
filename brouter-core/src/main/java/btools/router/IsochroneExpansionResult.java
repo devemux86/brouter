@@ -34,26 +34,28 @@ final class IsochroneExpansionResult {
   /**
    * Downsampled reachability cloud: every node the expansion popped, bucketed
    * into ~{@link RoutingEngine#REACHABILITY_CELL_M}-sized grid cells (fixed
-   * per-expansion scale; divisors below). A candidate surrounded by many
-   * occupied cells sits in a well-connected neighborhood; a dead-end pocket
-   * tip sits in a thin corridor of cells. Used for pocket-avoiding waypoint
-   * placement; empty for legacy constructions.
+   * per-expansion scale; divisors below), mapped to the minimum Dijkstra cost
+   * at which the cell was first reached (pops arrive in cost order, so the
+   * first touch is the cell's minimum). Key presence answers "reachable"
+   * (pocket-avoiding waypoint placement); the cost value is the raw material
+   * for {@link ReturnDistanceOracle}'s sector-resolved return estimates.
+   * Empty for legacy constructions.
    */
-  final java.util.Set<Long> visitedCells;
+  final java.util.Map<Long, Integer> cellMinCost;
   /** ilon units per reachability cell (longitude divisor), 0 when no cloud. */
   final int cellDivLon;
   /** ilat units per reachability cell (latitude divisor), 0 when no cloud. */
   final int cellDivLat;
 
   IsochroneExpansionResult(double[][] frontier, List<IsoCandidate> candidates) {
-    this(frontier, candidates, Collections.emptySet(), 0, 0);
+    this(frontier, candidates, Collections.emptyMap(), 0, 0);
   }
 
   IsochroneExpansionResult(double[][] frontier, List<IsoCandidate> candidates,
-                           java.util.Set<Long> visitedCells, int cellDivLon, int cellDivLat) {
+                           java.util.Map<Long, Integer> cellMinCost, int cellDivLon, int cellDivLat) {
     this.frontier = frontier;
     this.candidates = (candidates != null) ? candidates : Collections.emptyList();
-    this.visitedCells = (visitedCells != null) ? visitedCells : Collections.emptySet();
+    this.cellMinCost = (cellMinCost != null) ? cellMinCost : Collections.emptyMap();
     this.cellDivLon = cellDivLon;
     this.cellDivLat = cellDivLat;
   }
@@ -66,13 +68,13 @@ final class IsochroneExpansionResult {
    * near the edge.
    */
   int reachableCellsAround(int ilon, int ilat) {
-    if (visitedCells.isEmpty() || cellDivLon <= 0 || cellDivLat <= 0) return -1;
+    if (cellMinCost.isEmpty() || cellDivLon <= 0 || cellDivLat <= 0) return -1;
     int cx = ilon / cellDivLon;
     int cy = ilat / cellDivLat;
     int count = 0;
     for (int dx = -2; dx <= 2; dx++) {
       for (int dy = -2; dy <= 2; dy++) {
-        if (visitedCells.contains((((long) (cx + dx)) << 32) | ((cy + dy) & 0xFFFFFFFFL))) {
+        if (cellMinCost.containsKey((((long) (cx + dx)) << 32) | ((cy + dy) & 0xFFFFFFFFL))) {
           count++;
         }
       }
